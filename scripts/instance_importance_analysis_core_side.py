@@ -17,9 +17,9 @@ import shap
 import skfp
 import yaml
 from rdkit import Chem
-from rdkit.Chem import Draw, rdDepictor, rdMolDescriptors, rdmolops
+from rdkit.Chem import Draw, EState, rdDepictor, rdMolDescriptors, rdmolops
 from rdkit.Chem.Draw import rdMolDraw2D
-from rdkit.Chem.EState import AtomTypes, EStateIndices
+from rdkit.Chem.EState import AtomTypes
 from rdkit.Chem.EState.AtomTypes import _rawD
 from skfp.fingerprints import ECFPFingerprint, EStateFingerprint, FunctionalGroupsFingerprint
 
@@ -167,29 +167,69 @@ def get_core_ecfp_counts(mol: Chem.Mol, core_match: set, radius: int = 2, nBits:
     return filtered_counts
 
 
-def get_core_estate_sums(mol: Chem.Mol, core_match: set) -> np.ndarray:
-    """Calculates the 79-bin EState sums exclusively for atoms in the core."""
-    # Ensure RDKit has loaded the 79 EState SMARTS patterns
+def get_core_estate_sums(
+    whole_mol: Chem.Mol,
+    core_mol: Chem.Mol,
+    whole_core_match: tuple,
+    core_mol_match: tuple,
+) -> np.ndarray:
+    """
+    1. Independently computes EState indices and EState groups for `core_mol`.
+    2. Compares each core atom's group in `core_mol` against its group in `whole_mol`.
+    3. If the atom is assigned to a different group in `whole_mol` (e.g., aaCH -> aasC
+       at attachment points), reassigns its core EState value to the `whole_mol` group.
+    """
     if AtomTypes.esPatterns is None:
         AtomTypes.BuildPatts()
 
-    esIndices = EStateIndices(mol)
-    nPatts = len(AtomTypes.esPatterns)
-    estate_sums = np.zeros(nPatts, dtype=np.float64)
+    # 1. Independently compute EState indices and atom groups for the core molecule
+    es_core = EState.EStateIndices(core_mol)
+    types_core = AtomTypes.TypeAtoms(core_mol)
 
-    # Iterate through the 79 standard EState bins
-    for i, (name, pattern) in enumerate(AtomTypes.esPatterns):
-        matches = mol.GetSubstructMatches(pattern, uniquify=1)
+    # 2. Compute atom groups for the whole molecule
+    types_whole = AtomTypes.TypeAtoms(whole_mol)
 
-        for match in matches:
-            # RDKit maps the EState type to the first atom in the match tuple
-            atom_idx = match[0]
+    name_to_bin = {name: i for i, (name, _) in enumerate(AtomTypes.esPatterns)}
+    estate_sums = np.zeros(len(AtomTypes.esPatterns), dtype=np.float64)
 
-            # Only add the EState value to the bin if the atom is in the core
-            if atom_idx in core_match:
-                estate_sums[i] += esIndices[atom_idx]
+    # 3. Compare core vs. whole groups for every matched atom in the core
+    for whole_idx, core_idx in zip(whole_core_match, core_mol_match):
+        core_group = types_core[core_idx]
+        whole_group = types_whole[whole_idx]
+
+        # If the atom's group changed in the whole molecule, reassign to whole_group
+        if core_group != whole_group:
+            assigned_groups = []
+        else:
+            assigned_groups = core_group
+        # Add the independent core EState value to the assigned group bin(s)
+        for t_name in assigned_groups:
+            bin_idx = name_to_bin[t_name]
+            estate_sums[bin_idx] += es_core[core_idx]
 
     return estate_sums
+
+
+# def get_core_estate_sums(mol: Chem.Mol, core_match: set = None) -> np.ndarray:
+#     """Calculates the 79-bin EState sums using RDKit's official TypeAtoms logic."""
+#     if AtomTypes.esPatterns is None:
+#         AtomTypes.BuildPatts()
+#
+#     es_indices = EState.EStateIndices(mol)
+#     atom_types = AtomTypes.TypeAtoms(mol)
+#
+#     name_to_bin = {name: i for i, (name, _) in enumerate(AtomTypes.esPatterns)}
+#     estate_sums = np.zeros(len(AtomTypes.esPatterns), dtype=np.float64)
+#
+#     for atom_idx, types_for_atom in enumerate(atom_types):
+#         if core_match is not None and atom_idx not in core_match:
+#             continue
+#
+#         for t_name in types_for_atom:
+#             bin_idx = name_to_bin[t_name]
+#             estate_sums[bin_idx] += es_indices[atom_idx]
+#
+#     return estate_sums
 
 
 def get_core_functional_groups_counts(mol: Chem.Mol, core_match: set) -> np.ndarray:
@@ -242,6 +282,9 @@ def generate_core_reference_features(smiles_list: list, core_smarts: str, config
     all_core_features = []
     feature_names = []
 
+    core_mol = Chem.MolFromSmiles(core_smarts)
+    core_mol_match = core_mol.GetSubstructMatch(core_pattern)
+
     for s in smiles_list:
         mol = Chem.MolFromSmiles(s)
         matches = mol.GetSubstructMatches(core_pattern)
@@ -250,7 +293,8 @@ def generate_core_reference_features(smiles_list: list, core_smarts: str, config
         core_match = set(matches[0])
 
         ecfp_array = get_core_ecfp_counts(mol, core_match, radius, n_bits)
-        estate_array = get_core_estate_sums(mol, core_match)
+        estate_array = get_core_estate_sums(mol, core_mol, matches[0], core_mol_match)
+        # get_core_estate_sums(Chem.MolFromSmiles(core_smarts), core_match=None)
         desc_list = descriptor.calculate_core_descriptors(mol, core_match)
         fg_array = get_core_functional_groups_counts(mol, core_match)
 
@@ -521,7 +565,8 @@ def plot_custom_shap_bar(shap_exp: shap.Explanation, whole_df: pd.DataFrame, cor
         s_val = shap_vals[idx]
         plot_shap_vals.append(s_val)
         # Standard SHAP colors: Crimson for positive, dodger blue for negative
-        colors.append("#ff0051" if s_val > 0 else "#008bfb")
+        # colors.append("#ff0051" if s_val > 0 else "#008bfb")
+        colors.append("#138c4a" if s_val > 0 else "#c72127")
 
     fig_height = 0.5 + (0.5 * top_n_actual)
 
@@ -766,7 +811,7 @@ def main(smiles_list_all: List[str], output_dir: str = "outputs_brr", config_pat
 
 
 if __name__ == "__main__":
-    smiles = pd.read_csv("../../../notebooks/lab_smiles.csv")["smiles"].tolist()
+    smiles = pd.read_csv("../notebooks/lab_smiles.csv")["smiles"].tolist()
     print(len(smiles))
-    config_file = "../../../notebooks/rf_best_model/config.yaml"
-    main(smiles, output_dir="../../../notebooks/new_outputs_rf", config_path=config_file)
+    config_file = "../notebooks/rf_best_model/config.yaml"
+    main(smiles, output_dir="../notebooks/outputs_rf", config_path=config_file)
